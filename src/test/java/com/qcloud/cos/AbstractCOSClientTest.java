@@ -33,6 +33,7 @@ import com.qcloud.cos.auth.InstanceCredentialsProvider;
 import com.qcloud.cos.auth.InstanceMetadataCredentialsEndpointProvider;
 import com.qcloud.cos.endpoint.UserSpecifiedEndpointBuilder;
 import com.qcloud.cos.exception.CosServiceException;
+import com.qcloud.cos.utils.EndpointUtils;
 import com.qcloud.cos.internal.SkipMd5CheckStrategy;
 import com.qcloud.cos.internal.crypto.CryptoConfiguration;
 import com.qcloud.cos.internal.crypto.CryptoMode;
@@ -437,7 +438,9 @@ public class AbstractCOSClientTest {
         UinGrantee uinGrantee = new UinGrantee("734000014");
         acl.grantPermission(uinGrantee, Permission.Read);
         PutObjectRequest putObjectRequest = new PutObjectRequest(bucket, key, localFile);
-        putObjectRequest.setStorageClass(StorageClass.Standard_IA);
+        if (!EndpointUtils.isRapidBucket(bucket)) {
+            putObjectRequest.setStorageClass(StorageClass.Standard_IA);
+        }
         if (sseCKey != null) {
             putObjectRequest.setSSECustomerKey(sseCKey);
         }
@@ -504,7 +507,9 @@ public class AbstractCOSClientTest {
             input = new FileInputStream(localFile);
             PutObjectRequest putObjectRequest =
                     new PutObjectRequest(bucket, key, input, objectMetadata);
-            putObjectRequest.setStorageClass(StorageClass.Standard_IA);
+            if (!EndpointUtils.isRapidBucket(bucket)) {
+                putObjectRequest.setStorageClass(StorageClass.Standard_IA);
+            }
             PutObjectResult putObjectResult = cosclient.putObject(putObjectRequest);
             String etag = putObjectResult.getETag();
             if (useClientEncryption) {
@@ -770,7 +775,7 @@ public class AbstractCOSClientTest {
                 appendObjectRequest = new AppendObjectRequest(bucket, key, localFile);
             } else {
                 ObjectMetadata objectMetadata = new ObjectMetadata();
-                objectMetadata.setContentLength(size); 
+                objectMetadata.setContentLength(size);
                 appendObjectRequest = new AppendObjectRequest(bucket, key, new FileInputStream(localFile), objectMetadata);
             }
             appendObjectRequest.setPosition(nextAppendPosition);
@@ -831,7 +836,9 @@ public class AbstractCOSClientTest {
     }
 
     protected String testInitMultipart(InitiateMultipartUploadRequest request) {
-        request.setStorageClass(StorageClass.Standard_IA);
+        if (!EndpointUtils.isRapidBucket(bucket)) {
+            request.setStorageClass(StorageClass.Standard_IA);
+        }
         InitiateMultipartUploadResult initResult = cosclient.initiateMultipartUpload(request);
         return initResult.getUploadId();
     }

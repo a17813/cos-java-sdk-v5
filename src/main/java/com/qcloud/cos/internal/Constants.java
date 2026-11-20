@@ -56,4 +56,6 @@ public class Constants {
     public static final String UTF8_ENCODING = "UTF-8";
     public static final String BUCKET_COS_ARCH_TYPE = "COS";
     public static final String BUCKET_OFS_ARCH_TYPE = "OFS";
+
+    public static final String DEFAULT_DELIMITER = "/";
 }

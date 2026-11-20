@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MetaInsight: hybridsearch (multi-modal hybrid search)
 - MetaInsight: async dataset export (CreateDatasetExportJob / DescribeDatasetExportJob / DescribeDatasetExportJobs / CancelDatasetExportJob)
 
+## [5.6.261]
+- add COS Rapid Bucket (high-performance bucket) session auth support: `RapidSessionManager` automatically completes `CreateSession` on demand and caches/reuses session credentials per bucket
+- construct `COSClient` with `RapidCOSCredentialProvider` wrapping base credentials or a base `COSCredentialsProvider`; session authentication is selected by bucket name and request type, not by endpoint domain
+- rapid presigned URL support: with `RapidCOSCredentialProvider`, `COSClient.generatePresignedUrl` automatically uses session credentials when the bucket name matches the rapid bucket pattern (`<name>-x--<appid>`)
+- add `CreateSession` API to fetch temporary session credentials for rapid buckets
+
 ## [5.6.259]
 - FileHashSync
 - AIObjectDetect

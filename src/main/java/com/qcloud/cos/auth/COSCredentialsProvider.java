@@ -11,12 +11,14 @@
  * on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
  * express or implied. See the License for the specific language governing
  * permissions and limitations under the License.
- 
+
  * According to cos feature, we modify some class，comment, field name, etc.
  */
 
 
 package com.qcloud.cos.auth;
+
+import com.qcloud.cos.COSClient;
 
 public interface COSCredentialsProvider {
     /**
@@ -28,4 +30,11 @@ public interface COSCredentialsProvider {
     COSCredentials getCredentials();
 
     void refresh();
+
+    /**
+     * 带路由上下文的取凭证方法。cosClient 为发起 CreateSession 的主 client。
+     */
+    default COSCredentials getCredentials(COSClient cosClient, boolean useRapidSession, String bucketName) {
+        return getCredentials();
+    }
 }

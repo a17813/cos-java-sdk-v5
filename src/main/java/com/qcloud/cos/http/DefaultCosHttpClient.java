@@ -48,11 +48,8 @@ import com.qcloud.cos.ClientConfig;
 import com.qcloud.cos.Headers;
 import com.qcloud.cos.auth.COSCredentials;
 import com.qcloud.cos.auth.COSSigner;
-import com.qcloud.cos.endpoint.CIRegionEndpointBuilder;
-import com.qcloud.cos.endpoint.CIPicRegionEndpointBuilder;
+import com.qcloud.cos.utils.EndpointUtils;
 import com.qcloud.cos.internal.cihandler.HttpEntityEnclosingDelete;
-import com.qcloud.cos.internal.CIPicServiceRequest;
-import com.qcloud.cos.model.ListBucketsRequest;
 import com.qcloud.cos.region.Region;
 import com.qcloud.cos.event.ProgressInputStream;
 import com.qcloud.cos.event.ProgressListener;
@@ -116,6 +113,7 @@ import javax.net.ssl.SSLContext;
 public class DefaultCosHttpClient implements CosHttpClient {
 
     protected ClientConfig clientConfig;
+    private volatile boolean rapidClient;
     private RequestConfig requestConfig;
     protected HttpClient httpClient;
     private PoolingHttpClientConnectionManager connectionManager;
@@ -128,6 +126,11 @@ public class DefaultCosHttpClient implements CosHttpClient {
     private HandlerAfterProcess handlerAfterProcess;
     private final CosHttpClientTimer cosHttpClientTimer;
     private static final Logger log = LoggerFactory.getLogger(DefaultCosHttpClient.class);
+
+    /** 同步无桶名列桶请求所需的客户端类型。 */
+    public void setRapidClient(boolean rapidClient) {
+        this.rapidClient = rapidClient;
+    }
 
     public DefaultCosHttpClient(ClientConfig clientConfig) {
         super();
@@ -471,6 +474,14 @@ public class DefaultCosHttpClient implements CosHttpClient {
         }
 
         exception.setStatusCode(statusCode);
+        if (request.getRapidSessionSigner() != null
+                && "ExpiredToken".equals(exception.getErrorCode())) {
+            // 与 Go 一致，将 Session 过期响应交给现有重试策略。
+            apacheHttpResponse.setStatusCode(HttpStatus.SC_SERVICE_UNAVAILABLE);
+            apacheHttpResponse.setReasonPhrase("Service Unavailable");
+            exception.setStatusCode(HttpStatus.SC_SERVICE_UNAVAILABLE);
+            exception.setErrorType(ErrorType.Service);
+        }
         exception.fillInStackTrace();
         return exception;
     }
@@ -569,7 +580,7 @@ public class DefaultCosHttpClient implements CosHttpClient {
     }
 
     protected HttpResponse executeOneRequest(HttpContext context, HttpRequestBase httpRequest) throws Exception{
-        return httpClient.execute(httpRequest, context);
+        return RapidGatewayLoadBalancer.execute(httpClient, clientConfig, httpRequest, context);
     }
 
     private void closeHttpResponseStream(HttpResponse httpResponse) {
@@ -632,6 +643,9 @@ public class DefaultCosHttpClient implements CosHttpClient {
                     long delay = backoffStrategy.computeDelayBeforeNextRetry(retryIndex);
                     request.addHeader("x-cos-sdk-retry", "true");
                     Thread.sleep(delay);
+                    if (request.getRapidSessionSigner() != null) {
+                        request.getRapidSessionSigner().run();
+                    }
                 }
                 HttpContext context = HttpClientContext.create();
                 httpRequest = buildHttpRequest(request);
@@ -788,6 +802,7 @@ public class DefaultCosHttpClient implements CosHttpClient {
         HttpResponse httpResponse = null;
         try {
             originRequest.setClientAbortTaskMonitor(abortTaskMonitor);
+            context.setAttribute(RapidGatewayLoadBalancer.ABORT_MONITOR, abortTaskMonitor);
             httpResponse = executeOneRequest(context, httpRequest);
         } catch (IOException ie) {
             if (originRequest.getClientAbortTaskMonitor().hasTimeoutExpired()) {
@@ -886,40 +901,10 @@ public class DefaultCosHttpClient implements CosHttpClient {
     }
 
     private <X extends CosServiceRequest> void refreshEndpointAddr(CosHttpRequest<X> request) throws CosClientException {
-        boolean isCIRequest = request.getOriginalRequest() instanceof CIServiceRequest;
-        boolean isServiceRequest = request.getOriginalRequest() instanceof ListBucketsRequest;
-        String endpoint = "";
-        String endpointAddr = "";
-        if (isServiceRequest) {
-            endpoint = clientConfig.getEndpointBuilder().buildGetServiceApiEndpoint();
-            endpointAddr =
-                    clientConfig.getEndpointResolver().resolveGetServiceApiEndpoint(endpoint);
-        } else {
-
-            if (request.getOriginalRequest() instanceof CIPicServiceRequest) {
-                endpoint = new CIPicRegionEndpointBuilder(clientConfig.getRegion()).buildGeneralApiEndpoint(request.getBucketName());
-            } else if (isCIRequest) {
-                endpoint = new CIRegionEndpointBuilder(clientConfig.getRegion()).buildGeneralApiEndpoint(request.getBucketName());
-            } else {
-                endpoint = clientConfig.getEndpointBuilder().buildGeneralApiEndpoint(request.getBucketName());
-            }
-            endpointAddr = clientConfig.getEndpointResolver().resolveGeneralApiEndpoint(endpoint);
-        }
-
-        if (endpoint == null) {
-            throw new CosClientException("endpoint is null, please check your endpoint builder");
-        }
-        if (endpointAddr == null) {
-            throw new CosClientException(
-                    "endpointAddr is null, please check your endpoint resolver");
-        }
-
-        String fixedEndpointAddr = request.getOriginalRequest().getFixedEndpointAddr();
-        if (fixedEndpointAddr != null) {
-            request.setEndpoint(fixedEndpointAddr);
-        } else {
-            request.setEndpoint(endpointAddr);
-        }
+        String endpoint = EndpointUtils.buildEndpoint(request.getOriginalRequest(), request.getBucketName(),
+                clientConfig, rapidClient);
+        request.setEndpoint(EndpointUtils.resolveEndpoint(request.getOriginalRequest(), request.getBucketName(),
+                clientConfig, endpoint));
     }
 
     private boolean isCosDefaultHost(String host, String endPoint) {

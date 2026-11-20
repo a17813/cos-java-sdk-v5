@@ -101,6 +101,7 @@ public class CosServiceRequest implements Cloneable, ReadLimitInfo  {
     public String getFixedEndpointAddr() {
         return fixedEndpointAddr;
     }
+
     /**
      * Sets the optional progress listener for receiving updates about the progress of the request,
      * and returns a reference to this object so that method calls can be chained together.

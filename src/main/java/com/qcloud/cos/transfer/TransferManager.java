@@ -57,6 +57,7 @@ import com.qcloud.cos.exception.AbortedException;
 import com.qcloud.cos.exception.CosClientException;
 import com.qcloud.cos.exception.CosServiceException;
 import com.qcloud.cos.exception.FileLockException;
+import com.qcloud.cos.internal.Constants;
 import com.qcloud.cos.internal.CopyImpl;
 import com.qcloud.cos.internal.CosServiceRequest;
 import com.qcloud.cos.internal.FileLocks;
@@ -815,7 +816,7 @@ public class TransferManager {
                 if (listObjectsResponse == null) {
                     ListObjectsRequest listObjectsRequest =
                             new ListObjectsRequest().withBucketName(bucketName)
-                                    .withDelimiter(DEFAULT_DELIMITER).withPrefix(prefix);
+                                    .withDelimiter(Constants.DEFAULT_DELIMITER).withPrefix(prefix);
                     listObjectsResponse = cos.listObjects(listObjectsRequest);
                 } else {
                     listObjectsResponse = cos.listNextBatchOfObjects(listObjectsResponse);
@@ -826,7 +827,7 @@ public class TransferManager {
                     // we can't save both a directory and a file of the same
                     // name.
                     if (!s.getKey().equals(prefix) && !listObjectsResponse.getCommonPrefixes()
-                            .contains(s.getKey() + DEFAULT_DELIMITER)) {
+                            .contains(s.getKey() + Constants.DEFAULT_DELIMITER)) {
                         objectSummaries.add(s);
                         totalSize += s.getSize();
                     } else {
@@ -1227,8 +1228,6 @@ public class TransferManager {
     private static final String USER_AGENT_IMAGE_AUDITING_JOB =
             TransferManager.class.getName() + "_ImageAuditing/" + VersionInfoUtils.getVersion();
 
-
-    private static final String DEFAULT_DELIMITER = "/";
 
     /**
      * There is no need for threads from timedThreadPool if there is no more running threads in

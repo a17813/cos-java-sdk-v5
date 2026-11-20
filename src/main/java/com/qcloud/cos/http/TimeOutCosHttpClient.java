@@ -1,6 +1,7 @@
 package com.qcloud.cos.http;
 
 import com.qcloud.cos.ClientConfig;
+import com.qcloud.cos.internal.CosClientAbortTaskMonitor;
 import org.apache.http.HttpResponse;
 import org.apache.http.client.methods.HttpRequestBase;
 import org.apache.http.protocol.HttpContext;
@@ -13,6 +14,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.Callable;
+import java.util.concurrent.TimeoutException;
 
 public class TimeOutCosHttpClient  extends DefaultCosHttpClient{
     private ThreadPoolExecutor threadPool;
@@ -35,7 +37,23 @@ public class TimeOutCosHttpClient  extends DefaultCosHttpClient{
     protected HttpResponse executeOneRequest(HttpContext context, HttpRequestBase httpRequest) throws Exception{
         HttpRequestTask httpRequestTask = new HttpRequestTask(httpRequest, context);
         Future<HttpResponse> future = threadPool.submit(httpRequestTask);
-        return future.get(this.clientConfig.getRequestTimeout(), TimeUnit.MILLISECONDS);
+        try {
+            return future.get(this.clientConfig.getRequestTimeout(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            RapidGatewayLoadBalancer.timedOut(context);
+            httpRequest.abort();
+            future.cancel(true);
+            throw e;
+        } catch (InterruptedException e) {
+            CosClientAbortTaskMonitor monitor =
+                    (CosClientAbortTaskMonitor) context.getAttribute(RapidGatewayLoadBalancer.ABORT_MONITOR);
+            if (monitor != null && monitor.hasTimeoutExpired()) {
+                RapidGatewayLoadBalancer.timedOut(context);
+            }
+            httpRequest.abort();
+            future.cancel(true);
+            throw e;
+        }
     }
 
     @Override
@@ -65,7 +83,7 @@ public class TimeOutCosHttpClient  extends DefaultCosHttpClient{
 
         @Override
         public HttpResponse call() throws Exception {
-            return httpClient.execute(httpRequest, httpContext);
+            return TimeOutCosHttpClient.super.executeOneRequest(httpContext, httpRequest);
         }
     }
 }

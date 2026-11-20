@@ -35,11 +35,13 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 import com.fasterxml.jackson.core.Version;
@@ -50,11 +52,10 @@ import com.qcloud.cos.auth.COSCredentialsProvider;
 import com.qcloud.cos.auth.COSSessionCredentials;
 import com.qcloud.cos.auth.COSSigner;
 import com.qcloud.cos.auth.COSStaticCredentialsProvider;
-import com.qcloud.cos.endpoint.CIPicRegionEndpointBuilder;
-import com.qcloud.cos.endpoint.CIRegionEndpointBuilder;
+import com.qcloud.cos.auth.RapidCOSCredentialProvider;
+import com.qcloud.cos.auth.RapidSessionCredentials;
 import com.qcloud.cos.endpoint.EndpointBuilder;
 import com.qcloud.cos.endpoint.RegionEndpointBuilder;
-import com.qcloud.cos.endpoint.UserSpecifiedEndpointBuilder;
 import com.qcloud.cos.exception.CosClientException;
 import com.qcloud.cos.exception.CosServiceException;
 import com.qcloud.cos.exception.CosServiceException.ErrorType;
@@ -186,6 +187,7 @@ public class COSClient implements COS {
         this.credProvider = credProvider;
         this.clientConfig = clientConfig;
         this.cosHttpClient = new DefaultCosHttpClient(clientConfig);
+        updateRapidClientMode();
     }
 
     public void shutdown() {
@@ -195,13 +197,20 @@ public class COSClient implements COS {
     public void setCOSCredentials(COSCredentials cred) {
         rejectNull(cred, "cred must not be null");
         this.credProvider = new COSStaticCredentialsProvider(cred);
+        updateRapidClientMode();
     }
 
     public void setCOSCredentialsProvider(COSCredentialsProvider credProvider) {
         rejectNull(credProvider, "credProvider must not be null");
         this.credProvider = credProvider;
+        updateRapidClientMode();
     }
 
+    private void updateRapidClientMode() {
+        if (cosHttpClient instanceof DefaultCosHttpClient) {
+            ((DefaultCosHttpClient) cosHttpClient).setRapidClient(credProvider instanceof RapidCOSCredentialProvider);
+        }
+    }
 
     @Override
     public ClientConfig getClientConfig() {
@@ -220,6 +229,76 @@ public class COSClient implements COS {
                     "credentials from Provider is null. please check your credentials provider");
         }
         return cred;
+    }
+
+    /**
+     * 需要使用 Rapid SessionCredential（临时数据密钥，有效期最大 5分钟）加签的请求类型白名单。
+     * 不在此白名单中的请求（桶级接口）一律使用基础凭证（长期凭证）加签。
+     */
+    private static final Set<Class<?>> RAPID_SESSION_REQUESTS = new HashSet<>(Arrays.asList(
+        // 对象级
+        PutObjectRequest.class,
+        GetObjectRequest.class,
+        GetObjectMetadataRequest.class,
+        DeleteObjectRequest.class,
+        DeleteObjectsRequest.class,
+        CopyObjectRequest.class,
+        RenameRequest.class,
+        // 分块级
+        InitiateMultipartUploadRequest.class,
+        UploadPartRequest.class,
+        CompleteMultipartUploadRequest.class,
+        AbortMultipartUploadRequest.class,
+        ListPartsRequest.class,
+        CopyPartRequest.class,
+        ListMultipartUploadsRequest.class,
+        // 桶级查询
+        ListObjectsRequest.class
+    ));
+
+    /**
+     * 判断当前请求是否需要使用 Rapid SessionCredential 加签。
+     */
+    private static boolean isRapidSessionRequest(CosServiceRequest request, String bucketName) {
+        if (request == null) {
+            return false;
+        }
+        // 通过桶名自动判断是否为高性能桶（桶名匹配 *-x--<appid> 规则）。
+        if (!EndpointUtils.isRapidBucket(bucketName)) {
+            return false;
+        }
+        // 先精确匹配，再检查继承关系（如 AbstractPutObjectRequest 的子类）。
+        if (RAPID_SESSION_REQUESTS.contains(request.getClass())) {
+            return true;
+        }
+        for (Class<?> clazz : RAPID_SESSION_REQUESTS) {
+            if (clazz.isInstance(request)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private COSCredentials resolveCredentials(
+        CosServiceRequest cosServiceRequest, String bucketName) throws CosClientException {
+        if (cosServiceRequest instanceof CreateSessionRequest) {
+            return fetchCredential();
+        }
+
+        // 只有白名单中的请求在 rapid 上下文中才使用 SessionCredential；
+        // 桶级接口（CreateSession、ListObjects、DeleteBucket 等）一律使用基础凭证。
+        boolean useRapidSession = isRapidSessionRequest(cosServiceRequest, bucketName);
+        if (!useRapidSession) {
+            return fetchCredential();
+        }
+
+        if (!(credProvider instanceof RapidCOSCredentialProvider)) {
+            throw new CosClientException(
+                "Rapid bucket requires RapidCOSCredentialProvider. "
+                    + "Please use new COSClient(new RapidCOSCredentialProvider(baseProvider), clientConfig).");
+        }
+        return ((RapidCOSCredentialProvider) credProvider).getCredentials(this, true, bucketName,
+                cosServiceRequest.getFixedEndpointAddr());
     }
 
     /**
@@ -262,15 +341,12 @@ public class COSClient implements COS {
         if (originalRequest.getCustomRequestHeaders() != null && originalRequest.getCustomRequestHeaders().containsKey("Pic-Operations")) {
             httpRequest.addHeader("Pic-Operations", originalRequest.getCustomRequestHeaders().get("Pic-Operations"));
         }
-        if (originalRequest instanceof ListBucketsRequest) {
-            buildUrlAndHost(httpRequest, bucketName, key, true);
-        } else {
+        if (!(originalRequest instanceof ListBucketsRequest)) {
             rejectNull(clientConfig.getRegion(),
                     "region is missing, you must set region when init clientConfig for the api.");
-            buildUrlAndHost(httpRequest, bucketName, key, false);
         }
+        buildUrlAndHost(httpRequest, bucketName, key);
         httpRequest.setProgressListener(originalRequest.getGeneralProgressListener());
-        httpRequest.setBucketName(bucketName);
         return httpRequest;
     }
 
@@ -360,7 +436,8 @@ public class COSClient implements COS {
                 formatBucket(copyObjectRequest.getSourceBucketName(),
                         (copyObjectRequest.getSourceAppid() != null)
                                 ? copyObjectRequest.getSourceAppid()
-                                : fetchCredential().getCOSAppId());
+                                : (EndpointUtils.isRapidBucket(copyObjectRequest.getSourceBucketName())
+                                        ? null : fetchCredential().getCOSAppId()));
         String copySourceHeader =
                 String.format("%s%s", srcEndpointBuilder.buildGeneralApiEndpoint(sourceBucket),
                         UrlEncoderUtils.encodeEscapeDelimiter(sourceKey));
@@ -431,7 +508,8 @@ public class COSClient implements COS {
                 formatBucket(copyPartRequest.getSourceBucketName(),
                         (copyPartRequest.getSourceAppid() != null)
                                 ? copyPartRequest.getSourceAppid()
-                                : fetchCredential().getCOSAppId());
+                                : (EndpointUtils.isRapidBucket(copyPartRequest.getSourceBucketName())
+                                        ? null : fetchCredential().getCOSAppId()));
         String copySourceHeader =
                 String.format("%s%s", srcEndpointBuilder.buildGeneralApiEndpoint(sourceBucket),
                         UrlEncoderUtils.encodeEscapeDelimiter(sourceKey));
@@ -505,38 +583,34 @@ public class COSClient implements COS {
     }
 
     private <X extends CosServiceRequest> void buildUrlAndHost(CosHttpRequest<X> request,
-                                                               String bucket, String key, boolean isServiceRequest) throws CosClientException {
+                                                               String bucket, String key) throws CosClientException {
         boolean isCIRequest = request.getOriginalRequest() instanceof CIServiceRequest;
         key = formatKey(key);
-        request.setResourcePath(key);
-        String endpoint = "";
-        String endpointAddr = "";
-        if (isServiceRequest) {
-            endpoint = clientConfig.getEndpointBuilder().buildGetServiceApiEndpoint();
-            endpointAddr =
-                    clientConfig.getEndpointResolver().resolveGetServiceApiEndpoint(endpoint);
-        } else {
-            bucket = formatBucket(bucket, fetchCredential().getCOSAppId());
-            if (request.getOriginalRequest() instanceof CIPicServiceRequest) {
-                endpoint = new CIPicRegionEndpointBuilder(clientConfig.getRegion()).buildGeneralApiEndpoint(bucket);
-            } else if (isCIRequest && !(clientConfig.getEndpointBuilder() instanceof UserSpecifiedEndpointBuilder)) {
-                endpoint = new CIRegionEndpointBuilder(clientConfig.getRegion()).buildGeneralApiEndpoint(bucket);
+        if (bucket != null || !(request.getOriginalRequest() instanceof ListBucketsRequest)) {
+            // 完整 Rapid 桶名已包含 appId，地址构造不依赖基础凭证。
+            bucket = formatBucket(bucket,
+                    EndpointUtils.isRapidBucket(bucket) ? null : fetchCredential().getCOSAppId());
+        }
+        request.setBucketName(bucket);
+        boolean isServiceRequest = EndpointUtils.isServiceRequest(request.getOriginalRequest(), bucket);
+        String endpoint = EndpointUtils.buildEndpoint(request.getOriginalRequest(), bucket,
+                clientConfig, credProvider instanceof RapidCOSCredentialProvider);
+        String endpointAddr = EndpointUtils.resolveEndpoint(request.getOriginalRequest(), bucket,
+                clientConfig, endpoint);
+
+        // Rapid 创删桶连接 service 地址，但必须通过桶 Host 标识目标桶。
+        if (clientConfig.getIsDistinguishHost() || (isServiceRequest && EndpointUtils.isRapidBucket(bucket))) {
+            String host;
+            if (isServiceRequest && bucket == null) {
+                // 无桶名的请求使用 service Host，与连接地址分离。
+                host = credProvider instanceof RapidCOSCredentialProvider
+                        ? String.format("service.%s.myqcloud.com", Region.formatRapidRegion(clientConfig.getRegion()))
+                        : "service.cos.myqcloud.com";
+            } else if (EndpointUtils.isRapidBucket(bucket)) {
+                host = String.format("%s.%s.myqcloud.com", bucket, Region.formatRapidRegion(clientConfig.getRegion()));
             } else {
-                endpoint = clientConfig.getEndpointBuilder().buildGeneralApiEndpoint(bucket);
+                host = String.format("%s.%s.myqcloud.com", bucket, Region.formatRegion(clientConfig.getRegion()));
             }
-            endpointAddr = clientConfig.getEndpointResolver().resolveGeneralApiEndpoint(endpoint);
-        }
-
-        if (endpoint == null) {
-            throw new CosClientException("endpoint is null, please check your endpoint builder");
-        }
-        if (endpointAddr == null) {
-            throw new CosClientException(
-                    "endpointAddr is null, please check your endpoint resolver");
-        }
-
-        if (clientConfig.getIsDistinguishHost()) {
-            String host = String.format("%s.%s.myqcloud.com", bucket, Region.formatRegion(clientConfig.getRegion()));
             request.addHeader(Headers.HOST,host);
         }else{
             request.addHeader(Headers.HOST, endpoint);
@@ -548,12 +622,7 @@ public class COSClient implements COS {
         } else {
             request.setProtocol(clientConfig.getHttpProtocol());
         }
-        String fixedEndpointAddr = request.getOriginalRequest().getFixedEndpointAddr();
-        if (fixedEndpointAddr != null) {
-            request.setEndpoint(fixedEndpointAddr);
-        } else {
-            request.setEndpoint(endpointAddr);
-        }
+        request.setEndpoint(endpointAddr);
 
         request.setResourcePath(key);
     }
@@ -575,8 +644,21 @@ public class COSClient implements COS {
             cosCredentials = cosServiceRequest.getCosCredentials();
             request.setCosCredentials(cosCredentials);
         } else {
-            cosCredentials = fetchCredential();
+            String bucketName = request.getBucketName();
+            cosCredentials = resolveCredentials(cosServiceRequest, bucketName);
             request.setCosCredentials(cosCredentials);
+            if (isRapidSessionRequest(cosServiceRequest, bucketName)) {
+                request.setRapidSessionSigner(() -> {
+                    COSCredentials sessionCredentials = resolveCredentials(cosServiceRequest, bucketName);
+                    request.setCosCredentials(sessionCredentials);
+                    Date sessionExpiredTime = new Date(
+                            System.currentTimeMillis() + clientConfig.getSignExpired() * 1000);
+                    // 移除旧 token，签名后由 signer 写入本次凭证的 token。
+                    request.getHeaders().remove(Headers.SECURITY_TOKEN);
+                    cosSigner.setCIWorkflowRequest(false);
+                    cosSigner.sign(request, sessionCredentials, sessionExpiredTime);
+                });
+            }
         }
         Date expiredTime = new Date(System.currentTimeMillis() + clientConfig.getSignExpired() * 1000);
         boolean isCIWorkflowRequest = cosServiceRequest instanceof  CIWorkflowServiceRequest;
@@ -833,7 +915,11 @@ public class COSClient implements COS {
         CosHttpRequest<RenameRequest> request = createRequest(renameRequest.getBucketName(),
                 renameRequest.getDstObject(), renameRequest, HttpMethodName.PUT);
         request.addParameter("rename", null);
-        request.addHeader("x-cos-rename-source", UrlEncoderUtils.encodeEscapeDelimiter(renameRequest.getSrcObject()));
+        request.addHeader(Headers.COS_RENAME_SOURCE, UrlEncoderUtils.encodeEscapeDelimiter(renameRequest.getSrcObject()));
+        // 高性能桶专用：禁止覆盖目标路径上的同名文件对象
+        if (renameRequest.isForbidOverwrite()) {
+            request.addHeader(Headers.COS_RENAME_FORBID_OVERWRITE, "true");
+        }
         try {
             invoke(request, voidCosResponseHandler);
         } catch (CosServiceException cse) {
@@ -1628,6 +1714,35 @@ public class COSClient implements COS {
     }
 
     @Override
+    public CreateSessionResult createSession(CreateSessionRequest createSessionRequest)
+            throws CosClientException, CosServiceException {
+        return createSessionInternal(createSessionRequest);
+    }
+
+    /** 发起 CreateSession 请求（GET /?session），使用基础凭证加签。 */
+    private CreateSessionResult createSessionInternal(
+        CreateSessionRequest createSessionRequest) throws CosClientException, CosServiceException {
+        rejectNull(createSessionRequest,
+                "The CreateSessionRequest parameter must be specified.");
+        String bucketName = createSessionRequest.getBucketName();
+        rejectNull(bucketName, "The bucketName parameter must be specified.");
+        rejectNull(clientConfig.getRegion(),
+                "region is null, region in clientConfig must be specified when creating session");
+        if (!EndpointUtils.isRapidBucket(bucketName)) {
+            throw new CosClientException(
+                    "CreateSession is only supported for rapid bucket (bucket name must match *-x--<appid> pattern, "
+                            + "e.g. mybucket-x--1253960454). Current bucket: " + bucketName);
+        }
+
+        createSessionRequest.putCustomQueryParameter("session", null);
+
+        CosHttpRequest<CreateSessionRequest> request =
+                createRequest(bucketName, "/", createSessionRequest, HttpMethodName.GET);
+
+        return invoke(request, new CreateSessionResultHandler());
+    }
+
+    @Override
     public List<Bucket> listBuckets() throws CosClientException, CosServiceException {
         return listBuckets(new ListBucketsRequest());
     }
@@ -2058,6 +2173,19 @@ public class COSClient implements COS {
                 "The bucket name parameter must be specified when listing objects in a bucket");
         rejectNull(clientConfig.getRegion(),
                 "region is null, region in clientConfig must be specified when listing objects in a bucket");
+
+        // Rapid 桶要求 delimiter="/"，prefix 为空或以 "/" 结尾
+        if (EndpointUtils.isRapidBucket(listObjectsRequest.getBucketName())) {
+            if (listObjectsRequest.getDelimiter() == null) {
+                listObjectsRequest.setDelimiter(Constants.DEFAULT_DELIMITER);
+            } else if (!listObjectsRequest.getDelimiter().equals(Constants.DEFAULT_DELIMITER)) {
+                throw new IllegalArgumentException("delimiter must be '/' for Rapid bucket");
+            }
+            String prefix = listObjectsRequest.getPrefix();
+            if (prefix != null && !prefix.isEmpty() && !prefix.endsWith("/")) {
+                throw new IllegalArgumentException("prefix must end with '/' for Rapid bucket");
+            }
+        }
 
         final boolean shouldSDKDecodeResponse = listObjectsRequest.getEncodingType() == null;
 
@@ -3038,7 +3166,7 @@ public class COSClient implements COS {
             request.addRequestParameter(entry.getKey(), entry.getValue());
         }
 
-        if (signHost) {
+        if (signHost && !clientConfig.getIsDistinguishHost()) {
             request.putCustomRequestHeader(Headers.HOST, this.clientConfig.getEndpointBuilder().buildGeneralApiEndpoint(bucketName));
         }
 
@@ -3058,6 +3186,45 @@ public class COSClient implements COS {
 
     @Override
     public URL generatePresignedUrl(GeneratePresignedUrlRequest req, Boolean signHost) throws CosClientException {
+        COSCredentials cred;
+        String bucketName = req != null ? req.getBucketName() : null;
+
+        // 通过桶名自动判断：高性能桶使用 Session 临时密钥加签
+        if (EndpointUtils.isRapidBucket(bucketName)) {
+            if (!(credProvider instanceof RapidCOSCredentialProvider)) {
+                throw new CosClientException(
+                    "Rapid bucket requires RapidCOSCredentialProvider. "
+                    + "Please use new COSClient(new RapidCOSCredentialProvider(baseProvider), clientConfig).");
+            }
+            // Rapid bucket 预签名不支持PrefixMode。
+            req.setSignPrefixMode(false);
+            long nowMillis = System.currentTimeMillis();
+            Date expiration = req.getExpiration();
+            if (expiration == null) {
+                // 获取 Session 前固定签名结束时间，避免请求耗时延长有效期。
+                expiration = new Date(nowMillis + this.clientConfig.getSignExpired() * 1000L);
+                req.setExpiration(expiration);
+            }
+            long requiredRemainingSec = expiration.getTime() / 1000L - nowMillis / 1000L;
+            if (requiredRemainingSec <= 0) {
+                throw new CosClientException(
+                    "The expiration time has already passed. Please specify a future expiration time.");
+            }
+            RapidCOSCredentialProvider rapidProvider = (RapidCOSCredentialProvider) credProvider;
+            cred = rapidProvider.getCredentialsForPresign(
+                    this, bucketName, requiredRemainingSec, req.getFixedEndpointAddr());
+            if (cred == null) {
+                throw new CosClientException(
+                    "Failed to obtain rapid session credentials for bucket: " + bucketName);
+            }
+        } else {
+            // 常规桶：使用基础凭证
+            cred = fetchCredential();
+        }
+        return generatePresignedUrlInternal(req, signHost, cred);
+    }
+
+    private URL generatePresignedUrlInternal(GeneratePresignedUrlRequest req, Boolean signHost, COSCredentials cred) throws CosClientException {
         rejectNull(clientConfig.getRegion(),
                 "region is null, region in clientConfig must be specified when generating a pre-signed URL");
         rejectNull(req, "The request parameter must be specified when generating a pre-signed URL");
@@ -3095,6 +3262,8 @@ public class COSClient implements COS {
             }
         }
 
+        String urlHost = clientConfig.getEndpointBuilder()
+                .buildGeneralApiEndpoint(formatBucket(bucketName, cred.getCOSAppId()));
         if (!signHost) {
             Map<String, String> headers = request.getHeaders();
             if (headers.containsKey(Headers.HOST)) {
@@ -3104,15 +3273,26 @@ public class COSClient implements COS {
 
         addResponseHeaderParameters(request, req.getResponseHeaders());
 
+        Date signExpiration = new Date(req.getExpiration().getTime());
+        if (EndpointUtils.isRapidBucket(bucketName) && cred instanceof RapidSessionCredentials) {
+            long signEndSec = signExpiration.getTime() / 1000L;
+            if (signEndSec <= System.currentTimeMillis() / 1000L) {
+                throw new CosClientException(
+                        "The expiration time has already passed. Please specify a future expiration time.");
+            }
+            if (signEndSec > ((RapidSessionCredentials) cred).getExpiredTimeSec()) {
+                throw new CosClientException(
+                        "The pre-signed URL expiration exceeds the session credential expiration. "
+                        + "Please reduce the pre-signed URL expiration time.");
+            }
+        }
         COSSigner cosSigner = new COSSigner();
-        COSCredentials cred = fetchCredential();
         String authStr =
                 cosSigner.buildAuthorizationStr(request.getHttpMethod(), request.getResourcePath(),
-                        request.getHeaders(), request.getParameters(), cred, req.getExpiration(), signHost);
+                        request.getHeaders(), request.getParameters(), cred, signExpiration, signHost);
         StringBuilder strBuilder = new StringBuilder();
         strBuilder.append(clientConfig.getHttpProtocol().toString()).append("://");
-        strBuilder.append(clientConfig.getEndpointBuilder()
-                .buildGeneralApiEndpoint(formatBucket(bucketName, cred.getCOSAppId())));
+        strBuilder.append(urlHost);
         strBuilder.append(UrlEncoderUtils.encodeUrlPath(formatKey(key)));
 
         boolean hasAppendFirstParameter = false;
@@ -4642,11 +4822,11 @@ public class COSClient implements COS {
 
         addParameterIfNotNull(request, "versionId", getObjectRequest.getVersionId());
 
-        COSCredentials cred = fetchCredential();
+        String appid = EndpointUtils.isRapidBucket(bucketName) ? null : fetchCredential().getCOSAppId();
         StringBuilder strBuilder = new StringBuilder();
         strBuilder.append(clientConfig.getHttpProtocol().toString()).append("://");
         strBuilder.append(clientConfig.getEndpointBuilder()
-                .buildGeneralApiEndpoint(formatBucket(bucketName, cred.getCOSAppId())));
+                .buildGeneralApiEndpoint(formatBucket(bucketName, appid)));
         strBuilder.append(UrlEncoderUtils.encodeUrlPath(formatKey(key)));
 
         boolean hasAppendFirstParameter = false;
@@ -4741,9 +4921,9 @@ public class COSClient implements COS {
         rejectNull(aiObjectDetectRequest.getBucketName(),
                 "The bucketName parameter must be specified for AI object detect");
         CosHttpRequest<CreateAIObjectDetectJobRequest> request = createRequest(
-                aiObjectDetectRequest.getBucketName(), 
-                aiObjectDetectRequest.getObjectKey(), 
-                aiObjectDetectRequest, 
+                aiObjectDetectRequest.getBucketName(),
+                aiObjectDetectRequest.getObjectKey(),
+                aiObjectDetectRequest,
                 HttpMethodName.GET);
         // 通用参数
         request.addParameter("ci-process", aiObjectDetectRequest.getCiProcess());
@@ -4782,11 +4962,11 @@ public class COSClient implements COS {
                 HttpMethodName.GET);
         request.addParameter("ci-process", "AIPortraitMatting");
         addParameterIfNotNull(request, "detect-url", aiPortraitMattingRequest.getDetectUrl());
-        addParameterIfNotNull(request, "center-layout", 
-                aiPortraitMattingRequest.getCenterLayout() != null ? 
+        addParameterIfNotNull(request, "center-layout",
+                aiPortraitMattingRequest.getCenterLayout() != null ?
                         String.valueOf(aiPortraitMattingRequest.getCenterLayout()) : null);
         addParameterIfNotNull(request, "padding-layout", aiPortraitMattingRequest.getPaddingLayout());
-        
+
         COSObject cosObject = invoke(request, new COSObjectResponseHandler());
         AIPortraitMattingResponse response = new AIPortraitMattingResponse();
         response.setImageStream(cosObject.getObjectContent());
@@ -6021,7 +6201,7 @@ public class COSClient implements COS {
         return invoke(request, new Unmarshallers.CICommonUnmarshaller<CreatePosterProductionResponse>(CreatePosterProductionResponse.class));
     }
 
-    @Override 
+    @Override
     public VirusDetectResponse createVirusDetectJob(VirusDetectRequest request) {
         CosHttpRequest<VirusDetectRequest> req = createRequest(request.getBucketName(), "/virus/detect", request, HttpMethodName.POST);
         this.setContent(req, CIAuditingXmlFactoryV2.convertToXmlByteArray(request), "application/xml", false);
@@ -6118,7 +6298,7 @@ public class COSClient implements COS {
                 "The bucketName parameter must be specified for file hash code sync calculation");
         rejectNull(fileHashCodeSyncRequest.getObjectKey(),
                 "The objectKey parameter must be specified for file hash code sync calculation");
-        
+
         CosHttpRequest<FileHashCodeSyncRequest> request = createRequest(
                 fileHashCodeSyncRequest.getBucketName(),
                 fileHashCodeSyncRequest.getObjectKey(),
@@ -6127,7 +6307,7 @@ public class COSClient implements COS {
         request.addParameter("ci-process", "filehash");
         addParameterIfNotNull(request, "type", fileHashCodeSyncRequest.getType());
         addParameterIfNotNull(request, "addtoheader", fileHashCodeSyncRequest.getAddToHeader());
-        
+
         return invoke(request, new COSXmlResponseHandler<>(new Unmarshallers.FileHashCodeSyncResponseUnmarshaller()));
     }
 

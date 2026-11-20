@@ -62,6 +62,9 @@ public class CosHttpRequest<T extends CosServiceRequest> {
 
     private COSCredentials cosCredentials;
 
+    /** 重试前重新获取 Session 凭证并签名。 */
+    private Runnable rapidSessionSigner;
+
     private List<ExceptionLogDetail> logDetails = new ArrayList<ExceptionLogDetail>();
 
     private CosClientAbortTaskMonitor clientAbortTaskMonitor = DefaultClientAbortTaskImpl.INSTANCE;
@@ -176,6 +179,14 @@ public class CosHttpRequest<T extends CosServiceRequest> {
 
     public void setCosCredentials(COSCredentials cosCredentials) {
         this.cosCredentials = cosCredentials;
+    }
+
+    public Runnable getRapidSessionSigner() {
+        return rapidSessionSigner;
+    }
+
+    public void setRapidSessionSigner(Runnable rapidSessionSigner) {
+        this.rapidSessionSigner = rapidSessionSigner;
     }
 
     public void addLogDetails(ExceptionLogDetail logDetail) {
